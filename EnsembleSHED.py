@@ -1,21 +1,27 @@
-#option to burn stream? or leave to them to do so and use in import
-#how to select flow acc? set and area min and calcualte it based on resoltuion? , include in ensemble?
-#currently flow acc is changing base on resoltuoin
-
 import os
+import math
+from math import pi
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import fiona
+
 from shapely import geometry, ops
 from shapely.ops import unary_union
 from shapely.geometry import LineString
+from shapely.geometry import shape
+from shapely.geometry import Polygon
+from shapely.geometry import Point
+from shapely.ops import nearest_points
+
 from pysheds.grid import Grid
 import rasterio
 from rasterio.enums import Resampling
 from scipy.stats import gaussian_kde
+
 import matplotlib.pyplot as plt
 from matplotlib import colors
+import seaborn as sns
 import time
 
 def timer(func):
@@ -26,7 +32,6 @@ def timer(func):
         print(f"Elapsed time: {end_time - start_time:.4f} seconds")
         return result
     return wrapper
-
 
 def create_output_dirs():
     """Create the necessary output directories"""
@@ -40,14 +45,14 @@ def create_output_dirs():
         os.makedirs("output/plots")
     if not os.path.exists("output/ensembleSHEDs"):
         os.makedirs("output/ensembleSHEDs")
-
+    if not os.path.exists("output/ShedStats"):
+        os.makedirs("output/ShedStats")
 
 def get_resolution_from_raster(elevation_raster):
     with rasterio.open(elevation_raster) as src:
         # Get the x and y pixel sizes
         res = src.res
         x_res, y_res = res[0], res[1]
-        print(f"X resolution: {x_res}, Y resolution: {y_res}")
 
         # Check if x and y resolutions are the same
         if x_res != y_res:
@@ -55,6 +60,10 @@ def get_resolution_from_raster(elevation_raster):
 
         return x_res
 
+def calculate_threshold(resolution, area):
+    cell_area = resolution ** 2  # Calculate area of each cell in square meters
+    threshold_cells = area * 1000000 / cell_area  # Convert desired area from km² to square meters and divide by cell area
+    return threshold_cells
 
 def resample_raster(input_path, output_path, upscale_factor, method):
     with rasterio.open(input_path) as dataset:
@@ -86,7 +95,7 @@ def resample_raster(input_path, output_path, upscale_factor, method):
         with rasterio.open(output_path, "w", **output_profile) as dst:
             dst.write(data)
 
-
+@timer
 def delineate_catchment(elevation_raster,shed_path, x, y, threshold):
     # Read the input raster object
     grid = Grid.from_raster(elevation_raster)
@@ -123,7 +132,6 @@ def delineate_catchment(elevation_raster,shed_path, x, y, threshold):
     catchment_gdf.to_file(shed_path, driver='ESRI Shapefile')
 
     return grid, dem, dirmap, fdir, acc, clipped_catch
-
 
 def plot_results(grid, dem, dirmap, fdir, acc, clipped_catch, plot_path):
     # Create figure with 4 subplots
@@ -273,49 +281,233 @@ def convert_polygons_to_polylines():
     output_filepath = os.path.join(output_directory, 'merged_polylines.shp')
     merged_polylines_gdf.to_file(output_filepath)
 
-
 @timer
-def ensemble_shed(elevation_raster, x, y, threshold, resampling_methods, nres, resolutions):
+def ensemble_shed(raster_dir, x, y, threshold_area, resampling_methods, resolutions):
 
-    #perform delienation for native resoluiton
-    catchment_path = 'output/sheds/shed_original.shp'
-    plot_path = 'output/plots/plot_original.png'
-    grid, dem, dirmap, fdir, acc, clipped_catch = delineate_catchment(elevation_raster, catchment_path, x, y, threshold)
-    plot_results(grid, dem, dirmap, fdir, acc, clipped_catch, plot_path)
+    for file_name in os.listdir(raster_dir):
+        if file_name.endswith('.tif'):  # Check that the file is a TIFF file
+            elevation_raster = os.path.join(raster_dir, file_name)
+            nres = get_resolution_from_raster(elevation_raster)
+            native_threshold_cells = calculate_threshold(nres, threshold_area)
+            print("Native Resolution: " + str(nres) + ", threshold cells: " + str(native_threshold_cells))
 
-    #loop over resampling methods and resolutions
-    for method in resampling_methods:
-        for res in resolutions:
-            if res != nres:
-                factor = nres / res
-                print(factor, method, res)
-                resampled_path = f'output/rasters/Resampled_DEM_{method}_{res}.tif'  # Path for the output raster file
-                shed_path = f'output/sheds/shed_{method}_{res}.shp'
-                plot_path = f'output/plots/plot_{method}_{res}.png'
+            catchment_path = f'output/sheds/shed_{str(int(nres))}.shp'
+            plot_path = f'output/plots/plot_{str(int(nres))}.png'
 
-                resample_raster(elevation_raster, resampled_path, factor, getattr(Resampling, method))  # Call the resample_raster() function
-                grid, dem, dirmap, fdir, acc, clipped_catch = delineate_catchment(resampled_path, shed_path, x, y, threshold)
-                plot_results(grid, dem, dirmap, fdir, acc, clipped_catch, plot_path)
-            else:
-                print(f"Skipping resampling for resolution {res}")
+            grid, dem, dirmap, fdir, acc, clipped_catch = delineate_catchment(elevation_raster, catchment_path, x, y, native_threshold_cells)
+            plot_results(grid, dem, dirmap, fdir, acc, clipped_catch, plot_path)
+
+            #loop over resampling methods and resolutions
+            for method in resampling_methods:
+                for res in resolutions:
+                    if res > nres:
+                        factor = nres / res
+                        res_threshold_cells = calculate_threshold(res, threshold_area)
+                        print("Method, resolution, threshold cells: "+str(method), str(int(res)), str(res_threshold_cells))
+                        resampled_path = f'output/rasters/Resampled_DEM_{method}_{int(nres)}to{int(res)}.tif'  # Path for the output raster file
+                        shed_path = f'output/sheds/shed_{method}_{int(nres)}to{int(res)}.shp'
+                        plot_path = f'output/plots/plot_{method}_{int(nres)}to{int(res)}.png'
+
+                        resample_raster(elevation_raster, resampled_path, factor, getattr(Resampling, method))  # Call the resample_raster() function
+                        grid, dem, dirmap, fdir, acc, clipped_catch = delineate_catchment(resampled_path, shed_path, x, y, res_threshold_cells)
+                        plot_results(grid, dem, dirmap, fdir, acc, clipped_catch, plot_path)
+
+                    else:
+                        print(f"Skipping resampling for resolution {res}")
 
     max_shed = get_max_extent()
     min_shed = get_min_extent()
     convert_polygons_to_polylines()
 
+def calc_hausdorff_distance(first_shp, second_shp):
+    # Load the two polygons as Shapely objects
+    shp1 = first_shp.geometry.values[0]
+    shp2 = second_shp.geometry.values[0]
+
+    hausdorff_dist = shp1.hausdorff_distance(shp2)
+
+    return hausdorff_dist
+
+def jaccard_similarity(first_shp, second_shp):
+    # Load the two polygons as Shapely objects
+    shp1 = first_shp.geometry.values[0]
+    shp2 = second_shp.geometry.values[0]
+
+    intersection_area = shp1.intersection(shp2).area
+    union_area = shp1.union(shp2).area
+
+    jaccard_sim = intersection_area / union_area
+
+    return jaccard_sim
+
+def shed_stats(resolutions):
+    # List of Directories
+    dirs = ["output/sheds", "output/ensembleSHEDs"]
+
+    #Identify finest resolution
+    min_res = min(resolutions)
+    min_shed_path = os.path.join("output/sheds", f"shed_{min_res}.shp")
+
+    #Calculate stats for finest resolution
+    min_gdf = gpd.read_file(min_shed_path)
+    min_area = min_gdf.geometry.area
+    min_perimeter = min_gdf.geometry.length
+    min_polsby_popper = (4 * math.pi * min_area) / min_perimeter ** 2
+    min_centroid = min_gdf.centroid.values[0]
+
+    shed_stats = []
+    abs_diff_stats = []
+
+    shed_stats.append([f"shed_{min_res}.shp", min_area.item(), min_perimeter.item(),
+                       min_polsby_popper.item(), min_centroid])
+
+    for directory in dirs:
+        for file_name in os.listdir(directory):
+            if file_name.endswith(".shp") and os.path.join(directory, file_name) != min_shed_path:
+                print(file_name)
+                file_path = os.path.join(directory, file_name)
+                gdf = gpd.read_file(file_path)
+
+                area = gdf.geometry.area
+                perimeter = gdf.geometry.length
+                polsby_popper = (4 * math.pi * area) / perimeter ** 2
+                hausdorff_dist = calc_hausdorff_distance(min_gdf, gdf)
+                centroid = gdf.centroid.values[0]
+                jaccard_sim = jaccard_similarity(min_gdf, gdf)
+
+                shed_stats.append([file_name, area.item(), perimeter.item(),
+                                   polsby_popper.item(), centroid])
+
+                abs_diff_area = abs(min_area - area)
+                abs_diff_perimeter = abs(min_perimeter - perimeter)
+                abs_diff_polsby_popper = abs(min_polsby_popper - polsby_popper)
+                abs_centroid_distance = abs(min_centroid.distance(centroid))
+
+                abs_diff_stats.append([file_name,abs_diff_area.item(),abs_diff_perimeter.item(),
+                                       abs_diff_polsby_popper.item(),hausdorff_dist,
+                                       abs_centroid_distance, jaccard_sim])
+
+
+    shed_stats_df = pd.DataFrame(shed_stats, columns=['file_name',
+                                                          'area',
+                                                          'perimeter',
+                                                          'polsby_popper',
+                                                          'centroid'])
+
+    abs_diff_stats_df = pd.DataFrame(abs_diff_stats, columns=['file_name',
+                                                          'area_difference',
+                                                          'perimeter_difference',
+                                                          'polsby_popper_difference',
+                                                          'hausdorff_dist',
+                                                          'centroid_difference',
+                                                          'jaccard_sim'])
+
+    # Export the DataFrame as a CSV file
+    shed_stats_df.to_csv('output/ShedStats/shed_stats_table.csv', index=False)
+    abs_diff_stats_df.to_csv('output/ShedStats/shed_difference_table.csv', index=False)
+
+    return shed_stats_df, abs_diff_stats_df
+
+def normalize_stats(abs_diff_stats_df):
+    # Get the minimum and maximum values for each column
+    min_values = abs_diff_stats_df.iloc[:, 1:].min()
+    max_values = abs_diff_stats_df.iloc[:, 1:].max()
+
+    # Normalize each column using min-max normalization
+    normalized_df = (abs_diff_stats_df.iloc[:, 1:] - min_values) / (max_values - min_values)
+    normalized_df = pd.concat([abs_diff_stats_df.iloc[:, 0], normalized_df], axis=1)
+
+    return normalized_df
+
+def plot_heatmap(df):
+    df_to_plot = df.drop(df.columns[0], axis=1)
+    y_labels = df['file_name']
+    plt.figure(figsize=(10, 8)) # set figure size to 10x8 inches
+    ax = sns.heatmap(df_to_plot, cmap=sns.color_palette("crest", as_cmap=True), yticklabels=y_labels, annot=True, fmt=".2f", linewidths=0.5)
+    ax.tick_params(axis='y', labelsize=8) # increase font size of y-axis tick labels
+    plt.savefig('output/ShedStats/heatmap.png', dpi=300, bbox_inches='tight')
+
+def combined_score(similarity_df):
+    cmap = ['#8c510a', '#d8b365', '#f6e8c3', '#c7eae5', '#5ab4ac', '#01665e']
+    similarity_df = similarity_df.set_index('file_name')
+    ax = similarity_df.plot(kind='bar', stacked=True, ylim=(0, 6), color=cmap, alpha=0.75)
+    ax.set_ylabel('Combined Similarity Score (0-6)')
+    ax.set_xticklabels(similarity_df.index, rotation=45, ha='right')
+
+    similarity_df['sum'] = similarity_df.sum(axis=1)
+    # Add the value on top of each bar
+    for i, v in enumerate(similarity_df['sum']):
+        ax.text(i, v + 0.1, str(round(v, 2)), color='black', ha='center')
+
+    plt.tight_layout()
+    plt.savefig('output/ShedStats/combinedscore.png')
+
+def create_radar_plots(df):
+    columns = [col for col in df.columns if col != 'file_name']
+    num_rows = df.shape[0]
+    num_cols = int(
+        np.ceil(np.sqrt(num_rows)))  # Calculate the number of columns based on the square root of the number of rows
+
+    fig, axs = plt.subplots(num_cols, num_cols, figsize=(6 * num_cols, 6 * num_cols), subplot_kw=dict(polar=True))
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        values = row[columns].values.tolist()
+        values += values[:1]
+        angles = [n / float(len(columns)) * 2 * np.pi for n in range(len(columns))]
+        angles += angles[:1]
+
+        ax = axs[i // num_cols, i % num_cols] if num_rows > 1 else axs[
+            i % num_cols]  # Use a single axis if there's only one row
+        ax.plot(angles, values)
+        ax.fill(angles, values, alpha=0.1)
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+        ax.set_thetagrids(np.degrees(angles[:-1]), columns)
+        ax.set_title(row['file_name'])
+
+    # Remove any unused subplots
+    for i in range(num_rows * num_cols, len(axs.flat)):
+        fig.delaxes(axs.flatten()[i])
+
+    plt.tight_layout()
+    plt.savefig('output/ShedStats/radar_plots.png')
+
+def compare_similarity(abs_diff_stats_df):
+    normalized_df = normalize_stats(abs_diff_stats_df)
+    df_temp = normalized_df.drop(['file_name', 'jaccard_sim'], axis=1)
+    inverted_df = 1 - df_temp
+    similarity_df = pd.concat([normalized_df['file_name'], inverted_df, normalized_df['jaccard_sim']], axis=1)
+
+    similarity_df.to_csv('output/ShedStats/similarity_df.csv', index=False)
+    plot_heatmap(similarity_df)
+    combined_score(similarity_df)
+    create_radar_plots(similarity_df)
+
 
 if __name__ == '__main__':
-    elevation_raster = "C:/PhD/Courses/GEOG825/Capstone/Dev/Data/Canmore_DEM_MERIT_proj_Resam1.tif"
-    x, y = 477106.1775, 5657174.6435 #-115.327, 51.086   # Specify pour point
-    threshold = 300
+    #FortMac
+    raster_dir = "C:\PhD\Courses\GEOG825\Capstone\DEMs\FortMac"
+    x, y = 689363.1474, 6311325.8758
+
+    #Jasper
+    #raster_dir = "C:\PhD\Courses\GEOG825\Capstone\DEMs\Jasper"
+    #x, y = 318092.9584, 5884246.0063 # 318086.5806, 5884252.1877
+
+
+    #Jasper 318086.5806, 5884252.1877
+    #BowValleyTrail Near Grotto Canyon 486295.0985, 5655136.4168
+    #Canmore Cougar Creek 477106.1775, 5657174.6435
+    threshold_area = 1 #km^2
 
     resampling_methods = ['nearest', 'bilinear', 'cubic'] # Change this to the desired resampling methods
-    resolutions =[120,300]
+    resolutions =[1,15,30,60,90,120]
 
     create_output_dirs()
-    nres = get_resolution_from_raster(elevation_raster)
+    #ensemble_shed(raster_dir, x, y, threshold_area, resampling_methods, resolutions)
+    #shed_stats_df, abs_diff_stats_df = shed_stats(resolutions)
 
-    ensemble_shed(elevation_raster, x, y, threshold, resampling_methods, nres, resolutions)
+    abs_diff_stats_df = pd.read_csv("C:\PhD\Courses\GEOG825\Capstone\EnsembleShed\Lib\output\ShedStats\shed_difference_table.csv")
+    compare_similarity(abs_diff_stats_df)
 
 
 
